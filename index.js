@@ -1,57 +1,73 @@
-// index.js (ESM)
-// Minimal Discord -> HTTP forwarder
+// index.js
+import express from "express";
+import { Client, GatewayIntentBits, Events } from "discord.js";
 
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+// --- envs ---
+const TOKEN = process.env.DISCORD_TOKEN;
+const CHANNEL_ID = process.env.LISTEN_CHANNEL_ID;  // the Discord text channel ID
+const PIPE_URL = process.env.PIPE_URL;             // your n8n webhook URL
 
-// Use global fetch (Node 18+) or fall back if needed
-const fetchFn = globalThis.fetch ?? (await import('node-fetch')).default;
+console.log("ENV check:", {
+  hasToken: !!TOKEN,
+  hasChannel: !!CHANNEL_ID,
+  hasPipe: !!PIPE_URL,
+});
 
-const token = process.env.DISCORD_TOKEN;          // required
-const forwardUrl = process.env.FORWARD_URL;       // required
-const whitelistEnv = process.env.CHANNEL_WHITELIST || ""; // optional
-
-if (!token || !forwardUrl) {
-  console.error("Missing DISCORD_TOKEN or FORWARD_URL env vars");
+if (!TOKEN || !CHANNEL_ID || !PIPE_URL) {
+  console.error("Missing env vars. Set DISCORD_TOKEN, LISTEN_CHANNEL_ID, PIPE_URL.");
   process.exit(1);
 }
 
-const whitelist = whitelistEnv
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
-const isAllowed = (channelId) =>
-  whitelist.length === 0 || whitelist.includes(channelId);
-
+// --- discord client ---
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // make sure Message Content Intent is enabled in the bot settings
+    GatewayIntentBits.MessageContent,
   ],
 });
 
-client.once(Events.ClientReady, (c) => {
-  console.log("bot_ready", c.user.tag);
+client.once(Events.ClientReady, () => {
+  console.log("Discord bot ready. Listening on channel:", CHANNEL_ID);
 });
 
-client.on(Events.MessageCreate, async (message) => {
-  // ignore own/bot messages
-  if (message.author?.bot) return;
-  if (!isAllowed(message.channelId)) return;
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    if (msg.channelId !== CHANNEL_ID) return;
 
-  const payload = {
-    platform: "discord",
-    thread_id: message.channelId,
-    message_id: message.id,
-    content: message.content || "",
-    author: {
-      id: message.author?.id,
-      username: message.author?.username,
-      global_name: message.author?.globalName ?? null,
-    },
-    attachments: [...message.attachments.values()].map((a) => ({
-      id: a.id,
-      name: a.name,
-      url: a.url,
-      content_type: a
+    const payload = {
+      platform: "discord",
+      thread_id: msg.channelId,
+      message_id: msg.id,
+      content: msg.content || "",
+      author: {
+        id: msg.author.id,
+        username: msg.author.username,
+        global_name: msg.author.globalName ?? null,
+      },
+      attachments:
+        msg.attachments?.map?.((a) => ({
+          url: a.url,
+          contentType: a.contentType || null,
+        })) ?? [],
+    };
+
+    const r = await fetch(PIPE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    console.log("Forwarded to n8n →", r.status);
+  } catch (e) {
+    console.error("Forward error:", e);
+  }
+});
+
+client.login(TOKEN);
+
+// tiny server to keep the process alive
+const app = express();
+app.get("/", (_, res) => res.send("ok"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Tiny server up on", PORT));
