@@ -1,15 +1,15 @@
-// index.js — Tiny Discord → n8n forwarder with !human / !bot
-// Node 18+, discord.js v14, express for a tiny health server
-
+// index.js — Tiny Discord → n8n forwarder (thread-scoped !human / !bot)
 import express from "express";
-import { Client, GatewayIntentBits, Events, ChannelType } from "discord.js";
+import { Client, GatewayIntentBits, Events } from "discord.js";
 
 // ---------- ENV ----------
 const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;             // required
 const PIPE_URL        = process.env.PIPE_URL;                  // required (n8n webhook to forward messages)
-const ASSIGN_URL      = process.env.ASSIGN_URL || "";          // optional (n8n webhook to flip HUMAN/BOT)
-const LISTEN_CHANNELS = (process.env.LISTEN_CHANNEL_ID || "")  // supports comma-separated
-  .split(",").map(s => s.trim()).filter(Boolean);
+const ASSIGN_URL      = process.env.ASSIGN_URL || "";          // optional (n8n webhook to flip HUMAN/BOT for this thread)
+const LISTEN_CHANNELS = (process.env.LISTEN_CHANNEL_ID || "")  // supports comma-separated parent channel ids
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
 console.log("ENV check:", {
   hasToken: !!DISCORD_TOKEN,
@@ -23,14 +23,7 @@ if (!DISCORD_TOKEN || !PIPE_URL) {
 }
 
 // ---------- helpers ----------
-const isThreadType = (t) =>
-  t === ChannelType.PublicThread ||
-  t === ChannelType.PrivateThread ||
-  t === ChannelType.AnnouncementThread;
-
-const getBaseChannelId = (channel) =>
-  isThreadType(channel?.type) ? (channel.parentId || channel.id) : channel.id;
-
+const getBaseChannelId = (channel) => channel?.isThread?.() ? (channel.parentId || channel.id) : channel?.id;
 const isAllowedChannel = (message) => {
   if (!LISTEN_CHANNELS.length) return true; // allow all if not set
   const baseId = getBaseChannelId(message.channel);
@@ -48,43 +41,60 @@ const client = new Client({
 
 client.once(Events.ClientReady, (c) => {
   console.log(`✅ bot_ready ${c.user.tag}`);
-  console.log(`ℹ️  Listening on: ${LISTEN_CHANNELS.length ? LISTEN_CHANNELS.join(",") : "(all channels I can read)"}`);
+  console.log(
+    `ℹ️  Listening on: ${
+      LISTEN_CHANNELS.length ? LISTEN_CHANNELS.join(",") : "(all channels I can read)"
+    }`
+  );
 });
 
 client.on(Events.MessageCreate, async (msg) => {
   try {
-    // ignore bots/webhooks
+    // ignore bots/webhooks/system
     if (msg.author?.bot) return;
     if (!isAllowedChannel(msg)) return;
 
     const channel     = msg.channel;
-    const baseId      = getBaseChannelId(channel); // parent channel for threads
-    const threadId    = channel.id;                // actual container (thread or channel)
+    const isThread    = channel?.isThread?.() === true;
+    const baseId      = getBaseChannelId(channel);     // parent inbox channel id
+    const threadId    = isThread ? channel.id : null;  // specific conversation thread id (or null if not in a thread)
     const authorName  = msg.author?.globalName ?? msg.author?.username ?? "Unknown";
     const text        = (msg.content || "").trim();
+    const lower       = text.toLowerCase();
 
-    // ---- Commands: !human / !bot -> call assign webhook, don't forward ----
-    const lower = text.toLowerCase();
-    if ((lower === "!human" || lower === "!bot") && ASSIGN_URL) {
+    // ---- Commands: !human / !bot -> only allowed inside a thread ----
+    if (lower === "!human" || lower === "!bot") {
+      if (!ASSIGN_URL) {
+        try { await msg.reply("⚠️ assignment webhook not configured."); } catch {}
+        return;
+      }
+      if (!isThread) {
+        // guard: do not toggle the whole channel
+        try { await msg.reply("ℹ️ Please run `!human` / `!bot` **inside the conversation thread**."); } catch {}
+        return;
+      }
+
       const action = lower.slice(1); // 'human' or 'bot'
       try {
         const r = await fetch(ASSIGN_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            thread_id: threadId,
-            channel_id: baseId,
-            action,
+            action,                // 'human' | 'bot'
+            channel_id: baseId,    // parent inbox channel
+            thread_id: threadId,   // this specific thread
             actor: authorName,
           }),
         });
         console.log(`🔧 assign ${action} → ${r.status}`);
-        try { await msg.reply(r.ok ? `✅ set to **${action}**` : `⚠️ assign failed (${r.status})`); } catch {}
+        try {
+          await msg.reply(r.ok ? `✅ set to **${action}** for this thread` : `⚠️ assign failed (${r.status})`);
+        } catch {}
       } catch (e) {
-        console.error("assign_error", e?.message);
+        console.error("assign_error", e?.message || e);
         try { await msg.reply("⚠️ assign error"); } catch {}
       }
-      return; // stop here (do not forward command to WhatsApp)
+      return; // do not forward the command
     }
 
     // ---- Build attachments (urls only; expand later if needed) ----
@@ -100,8 +110,8 @@ client.on(Events.MessageCreate, async (msg) => {
     const payload = {
       platform: "discord",
       guild_id: msg.guild?.id ?? null,
-      channel_id: baseId,    // parent channel id (stable per thread)
-      thread_id: threadId,   // actual container (thread or channel)
+      channel_id: baseId,        // parent inbox
+      thread_id: threadId,       // specific conversation (null if not in a thread)
       message_id: msg.id,
       content: text,
       author: {
@@ -119,9 +129,9 @@ client.on(Events.MessageCreate, async (msg) => {
       body: JSON.stringify(payload),
     });
 
-    console.log(`➡️  forwarded → ${res.status} (${threadId})`);
+    console.log(`➡️  forwarded → ${res.status} (thread: ${threadId || "none"}, parent: ${baseId})`);
   } catch (e) {
-    console.error("message_handler_error", e?.message);
+    console.error("message_handler_error", e?.message || e);
   }
 });
 
