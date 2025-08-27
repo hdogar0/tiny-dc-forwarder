@@ -1,6 +1,6 @@
 // index.js — Tiny Discord → n8n forwarder (thread-scoped !human / !bot)
 import express from "express";
-import { Client, GatewayIntentBits, Events } from "discord.js";
+import { Client, GatewayIntentBits, Events, ChannelType } from "discord.js";
 
 // ---------- ENV ----------
 const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;             // required
@@ -14,6 +14,7 @@ const LISTEN_CHANNELS = (process.env.LISTEN_CHANNEL_ID || "")  // supports comma
 console.log("ENV check:", {
   hasToken: !!DISCORD_TOKEN,
   hasPipe: !!PIPE_URL,
+  hasAssign: !!ASSIGN_URL,
   listen: LISTEN_CHANNELS.length ? LISTEN_CHANNELS : "(all)",
 });
 
@@ -23,12 +24,55 @@ if (!DISCORD_TOKEN || !PIPE_URL) {
 }
 
 // ---------- helpers ----------
-const getBaseChannelId = (channel) => channel?.isThread?.() ? (channel.parentId || channel.id) : channel?.id;
+const isThread = (channel) => {
+  if (!channel) return false;
+  if (typeof channel.isThread === "function") return channel.isThread();
+  return (
+    channel.type === ChannelType.PublicThread ||
+    channel.type === ChannelType.PrivateThread ||
+    channel.type === ChannelType.AnnouncementThread
+  );
+};
+const getBaseChannelId = (channel) => (isThread(channel) ? (channel.parentId || channel.id) : channel?.id);
+const getIds = (channel) => {
+  const base = getBaseChannelId(channel);
+  return {
+    channel_id: base,                    // parent inbox channel
+    thread_id: isThread(channel) ? channel.id : null, // specific conversation thread (null if not a thread)
+  };
+};
 const isAllowedChannel = (message) => {
   if (!LISTEN_CHANNELS.length) return true; // allow all if not set
   const baseId = getBaseChannelId(message.channel);
   return LISTEN_CHANNELS.includes(baseId) || LISTEN_CHANNELS.includes(message.channel.id);
 };
+
+async function callAssign(mode, message) {
+  if (!ASSIGN_URL) return false;
+  const { channel_id, thread_id } = getIds(message.channel);
+  const payload = {
+    action: mode, // "human" | "bot"
+    channel_id,
+    thread_id,
+    author_id: message.author?.id,
+    author_name: message.author?.username,
+    content: message.content ?? "",
+  };
+
+  try {
+    const res = await fetch(ASSIGN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text().catch(() => "");
+    console.log("ASSIGN >", res.status, text || "(no body)");
+    return res.ok;
+  } catch (e) {
+    console.error("ASSIGN failed:", e?.message || e);
+    return false;
+  }
+}
 
 // ---------- discord client ----------
 const client = new Client({
@@ -42,9 +86,7 @@ const client = new Client({
 client.once(Events.ClientReady, (c) => {
   console.log(`✅ bot_ready ${c.user.tag}`);
   console.log(
-    `ℹ️  Listening on: ${
-      LISTEN_CHANNELS.length ? LISTEN_CHANNELS.join(",") : "(all channels I can read)"
-    }`
+    `ℹ️  Listening on: ${LISTEN_CHANNELS.length ? LISTEN_CHANNELS.join(",") : "(all channels I can read)"}`
   );
 });
 
@@ -54,13 +96,8 @@ client.on(Events.MessageCreate, async (msg) => {
     if (msg.author?.bot) return;
     if (!isAllowedChannel(msg)) return;
 
-    const channel     = msg.channel;
-    const isThread    = channel?.isThread?.() === true;
-    const baseId      = getBaseChannelId(channel);     // parent inbox channel id
-    const threadId    = isThread ? channel.id : null;  // specific conversation thread id (or null if not in a thread)
-    const authorName  = msg.author?.globalName ?? msg.author?.username ?? "Unknown";
-    const text        = (msg.content || "").trim();
-    const lower       = text.toLowerCase();
+    const text  = (msg.content || "").trim();
+    const lower = text.toLowerCase();
 
     // ---- Commands: !human / !bot -> only allowed inside a thread ----
     if (lower === "!human" || lower === "!bot") {
@@ -68,33 +105,17 @@ client.on(Events.MessageCreate, async (msg) => {
         try { await msg.reply("⚠️ assignment webhook not configured."); } catch {}
         return;
       }
-      if (!isThread) {
-        // guard: do not toggle the whole channel
+      if (!isThread(msg.channel)) {
         try { await msg.reply("ℹ️ Please run `!human` / `!bot` **inside the conversation thread**."); } catch {}
         return;
       }
 
-      const action = lower.slice(1); // 'human' or 'bot'
+      const mode = lower.slice(1); // 'human' or 'bot'
+      const ok = await callAssign(mode, msg);
       try {
-        const r = await fetch(ASSIGN_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action,                // 'human' | 'bot'
-            channel_id: baseId,    // parent inbox channel
-            thread_id: threadId,   // this specific thread
-            actor: authorName,
-          }),
-        });
-        console.log(`🔧 assign ${action} → ${r.status}`);
-        try {
-          await msg.reply(r.ok ? `✅ set to **${action}** for this thread` : `⚠️ assign failed (${r.status})`);
-        } catch {}
-      } catch (e) {
-        console.error("assign_error", e?.message || e);
-        try { await msg.reply("⚠️ assign error"); } catch {}
-      }
-      return; // do not forward the command
+        await msg.reply(ok ? `✅ set to **${mode}** for this thread` : `⚠️ failed to set ${mode} (check ASSIGN_URL / logs)`);
+      } catch {}
+      return; // do not forward the command to PIPE_URL
     }
 
     // ---- Build attachments (urls only; expand later if needed) ----
@@ -107,11 +128,12 @@ client.on(Events.MessageCreate, async (msg) => {
     }));
 
     // ---- Forward to n8n (PIPE_URL) ----
+    const { channel_id, thread_id } = getIds(msg.channel);
     const payload = {
       platform: "discord",
       guild_id: msg.guild?.id ?? null,
-      channel_id: baseId,        // parent inbox
-      thread_id: threadId,       // specific conversation (null if not in a thread)
+      channel_id,                 // parent inbox
+      thread_id,                  // specific conversation (null if not in a thread)
       message_id: msg.id,
       content: text,
       author: {
@@ -129,7 +151,7 @@ client.on(Events.MessageCreate, async (msg) => {
       body: JSON.stringify(payload),
     });
 
-    console.log(`➡️  forwarded → ${res.status} (thread: ${threadId || "none"}, parent: ${baseId})`);
+    console.log(`➡️  forwarded → ${res.status} (thread: ${thread_id || "none"}, parent: ${channel_id})`);
   } catch (e) {
     console.error("message_handler_error", e?.message || e);
   }
@@ -143,3 +165,7 @@ const app = express();
 app.get("/", (_req, res) => res.send("ok"));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 health on :${PORT}`));
+
+// keep process alive and noisy on unhandled errors
+process.on("unhandledRejection", (r) => console.error("UNHANDLED_REJECTION", r));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
